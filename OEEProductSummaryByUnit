@@ -1,0 +1,349 @@
+ALTER FUNCTION [dbo].[fnLocal_GetOEEProductSummaryByUnit](
+/* fnLocal_GetOEEProductSummaryByUnit
+SELECT * FROM dbo.fnLocal_GetOEEProductSummaryByUnit (418 ,'2022-07-04 00:00','2022-07-04 23:00',null,0)
+*/
+--=======================================================
+-- 2022-07-07 Praveen Billapati Initial version
+--Description : Returns production amount and Product & etc at unit level.
+--=======================================================
+ 	  @PUId                    Int ,
+  	  @StartTime               datetime,
+  	  @EndTime                 datetime,
+  	  @InTimeZone  	    	    	    	   nvarchar(200) = null,
+  	  @FilterNonProductiveTime int = 0
+  	  )
+Returns  @unitData Table(ProductId int,
+  	    	    	    	    	    	  Product nVarchar(100),
+  	    	    	    	    	    	  PPId Int,
+  	    	    	    	    	    	  PathId Int,
+  	    	    	    	    	    	  PathCode  nVarChar(100),
+  	    	    	    	    	    	  ProcessOrder nVarChar(100),
+  	    	    	    	    	    	  IdealSpeed Float DEFAULT 0,
+  	    	    	    	    	    	  ActualSpeed Float DEFAULT 0,
+  	    	    	    	    	    	  IdealProduction Float DEFAULT 0,
+  	    	    	    	    	    	  PerformanceRate Float DEFAULT 0,
+  	    	    	    	    	    	  NetProduction Float DEFAULT 0,
+  	    	    	    	    	    	  Waste Float DEFAULT 0,
+  	    	    	    	    	    	  QualityRate Float DEFAULT 0,
+  	    	    	    	    	    	  PerformanceDowntime Float DEFAULT 0,
+  	    	    	    	    	    	  RunTime Float DEFAULT 0,
+  	    	    	    	    	    	  Loadtime Float DEFAULT 0,
+  	    	    	    	    	    	  AvaliableRate Float DEFAULT 0,
+  	    	    	    	    	    	  OEE Float DEFAULT 0
+  	    	    	    	    	    	  ,NPT Float DEFAULT 0 --NPT for the time slice
+ 	  	  	  	  	  	  ,IsNPT BIT DEFAULT 0
+  	    	    	    	    	    	  )
+AS
+BEGIN
+SELECT @StartTime = dbo.fnServer_CmnConvertToDbTime(@StartTime,@InTimeZone)
+SELECT @endTime = dbo.fnServer_CmnConvertToDbTime(@endTime,@InTimeZone)
+SET @FilterNonProductiveTime = 1
+/********************************************************************
+*  	    	    	    	    	    	    	  Declarations  	    	    	    	    	    	    	  *
+********************************************************************/
+DECLARE  	  -- General
+  	    	  @rptParmProductSummary  	    	    	    	  int,  	  -- 1 - Summary Selected
+  	    	  @LoopCount  	    	    	    	    	    	  int,
+  	    	  @MaxLoops  	    	    	    	    	    	  int,
+  	    	  @LastRunStartTime  	    	    	    	  datetime,
+  	    	  @CurrentRunStartTime  	    	    	  datetime,
+  	    	  @CurrentRunEndTime  	    	    	    	  datetime,
+  	    	  @CurrentRunProdId  	    	    	    	  int,
+  	    	  @CurrentRunProdCodeDesc  	    	    	  nvarchar(50),
+  	    	  @CurrentRunMRPId  	    	    	    	  int,
+  	    	  @ProductionRateFactor  	    	    	  Float,
+  	    	  @CapRates  	    	    	    	    	    	  tinyint
+  	    	  SET   	  @rptParmProductSummary = 1 
+SELECT  	  @CapRates = dbo.fnCMN_OEERateIsCapped()
+  	    	    	    	    	    	    	    	  
+DECLARE  @Slices TABLE(  	  SliceId  	    	    	    	  int IDENTITY(1,1) PRIMARY KEY NONCLUSTERED,
+  	    	    	    	    	    	  ProdDayProdId  	    	  nvarchar(75) DEFAULT null ,
+  	    	    	    	    	    	  ProdIdSubGroupId  	  nvarchar(50) DEFAULT null,
+  	    	    	    	    	    	  StartId  	    	    	    	  int DEFAULT null,
+  	    	    	    	    	    	  StartTime  	    	    	  datetime,
+  	    	    	    	    	    	  EndTime  	    	    	    	  datetime,
+  	    	    	    	    	    	  PUId  	    	    	    	  int,
+  	    	    	    	    	    	  ProdId  	    	    	    	  int,
+  	    	    	    	    	    	  ProductionDay  	    	  datetime,
+  	    	    	    	    	    	  PPId  	    	    	    	  int,
+  	    	    	    	    	    	  PathId  	    	    	    	  Int,
+  	    	    	    	    	    	  EventId  	    	    	    	  int,
+  	    	    	    	    	    	  AppliedProdId  	    	  int,
+  	    	    	    	    	    	  -- ESignature
+  	    	    	    	    	    	  PerformUserId  	    	  int,
+  	    	    	    	    	    	  VerifyUserId  	    	  int,
+  	    	    	    	    	    	  PerformUserName  	    	  nvarchar(30), 
+  	    	    	    	    	    	  VerifyUserName  	    	  nvarchar(30), 
+  	    	    	    	    	    	  -- Other
+  	    	    	    	    	    	  NP  	    	    	    	    	  bit DEFAULT 0,
+  	    	    	    	    	    	  NPLabelRef  	    	    	  bit DEFAULT 0,
+  	    	    	    	    	    	  DowntimeTarget  	    	  float,
+  	    	    	    	    	    	  ProductionTarget  	  float,
+  	    	    	    	    	    	  WasteTarget  	    	    	  float,
+  	    	    	    	    	    	  -- Statistics
+  	    	    	    	    	    	  CalendarTime  	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  AvailableTime  	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  LoadingTime  	    	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  RunTimeGross  	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  ProductiveTime  	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  ProductionCount  	    	  int DEFAULT 0,
+  	    	    	    	    	    	  ProductionTotal  	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  ProductionNet  	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  ProductionIdeal  	    	  Float DEFAULT 0,
+  	    	    	    	    	    	  WasteQuantity  	    	  Float DEFAULT 0
+  	    	    	    	    	    	    	    	    	    	    	    	  ,NPT Float DEFAULT 0 --NPT for the time slice
+  	    	    	    	    	    	  )
+INSERT INTO @Slices(ProdDayProdId,ProdIdSubGroupId,StartId,StartTime,EndTime,
+  	    	    	    	    	  PUId,ProdId,ProductionDay,
+  	    	    	    	    	  PPId,PathId,EventId,AppliedProdId,PerformUserId,
+  	    	    	    	    	  VerifyUserId,PerformUserName, VerifyUserName, NP,NPLabelRef,
+  	    	    	    	    	  DowntimeTarget,ProductionTarget,WasteTarget,CalendarTime,AvailableTime,
+  	    	    	    	    	  LoadingTime,RunTimeGross,ProductiveTime,ProductionCount,ProductionTotal,
+  	    	    	    	    	  ProductionNet,ProductionIdeal,WasteQuantity,NPT)
+SELECT ProdDayProdId,ProdIdSubGroupId,StartId,StartTime,EndTime,
+  	    	    	    	    	  PUId,ProdId,ProductionDay,
+  	    	    	    	    	  PPId,PathId,EventId,AppliedProdId,PerformUserId,
+  	    	    	    	    	  VerifyUserId,PerformUserName, VerifyUserName, NP,NPLabelRef,
+  	    	    	    	    	  DowntimeTarget,ProductionTarget,WasteTarget,CalendarTime,AvailableTime,
+  	    	    	    	    	  LoadingTime,RunTimeGross,ProductiveTime,ProductionCount,ProductionTotal,
+  	    	    	    	    	  ProductionNet,ProductionIdeal,WasteQuantity,NPT
+  	    	    	    	    	   FROM  dbo.fnBF_wrQuickOEESlices(@PUId,@StartTime,@EndTime,@InTimeZone,@FilterNonProductiveTime,1,0)
+
+--select * from @Slices
+
+Declare @OEEType nvarchar(10)
+  	  Select 
+  	    	  @OEEType = EDFTV.Field_desc
+  	  From 
+  	    	  Table_Fields TF
+  	    	  JOIN Table_Fields_Values TFV on TFV.Table_Field_Id = TF.Table_Field_Id and TFV.TableId = TF.TableId
+  	    	  Join ED_FieldTypes EDFT On EDFT.ED_Field_Type_Id = TF.ED_Field_Type_Id
+  	    	  LEFT OUTER Join ED_FieldType_ValidValues EDFTV on EDFTV.ED_Field_Type_Id = TF.ED_Field_Type_Id AND EDFTV.Field_Id = TFV.Value
+  	  Where 
+  	    	  TF.Table_Field_Desc = 'OEE Calculation Type'
+  	    	  AND TFV.KeyID = @PUId
+
+--select @OEEType as OEEType
+  	    	    	    	    	   
+DECLARE @SliceUpdate TABLE (
+  	    	    	  SliceUpdateId int IDENTITY(1,1) PRIMARY KEY NONCLUSTERED,
+  	    	    	  StartTime  	  datetime,
+  	    	    	  EventId  	    	  int,
+  	    	    	  ProdId  	    	  int
+   	    	    	  )
+
+DECLARE @ProcessOrderSubGroup TABLE(
+  	    	    	  POSGId  	  int IDENTITY(1,1) PRIMARY KEY NONCLUSTERED,
+  	    	    	  ProdId  	    	    	  int,
+  	    	    	  Counts  	    	    	  int)
+  	    	    	  
+DECLARE  @rsSlices TABLE(RSSliceId  	  int IDENTITY(1,1) PRIMARY KEY NONCLUSTERED,
+  	    	    	    	  ProdDayProdId  	    	  nvarchar(75) DEFAULT null,
+  	    	    	    	  ProdIdSubGroupId  	  nvarchar(50) DEFAULT null,
+  	    	    	    	  StartId  	    	    	    	  int  	  DEFAULT null,
+  	    	    	    	  RSSubGroup  	    	    	  int,
+  	    	    	    	  SortReference  	    	  nvarchar(50)  	  DEFAULT null,
+  	    	    	    	  ProductionDay  	    	  nvarchar(50)  	  DEFAULT null,
+  	    	    	    	  PPId  	    	    	    	  int DEFAULT null,
+  	    	    	    	  PathId  	    	    	    	  int DEFAULT null,
+  	    	    	    	  ProdId  	    	    	    	  int DEFAULT null,
+  	    	    	    	  EventId  	    	    	    	  int DEFAULT null,
+  	    	    	    	  NPLabelRef  	    	    	  int DEFAULT 0,
+  	    	    	    	  ProcessOrder  	    	  nvarchar(50)  	  DEFAULT null,
+  	    	    	    	  Product  	    	    	    	  nvarchar(50)  	  DEFAULT null,
+  	    	    	    	  IdealSpeed  	    	    	  Float DEFAULT 0,
+  	    	    	    	  ActualSpeed  	    	    	  Float DEFAULT 0,
+  	    	    	    	  IdealProd  	    	    	  Float DEFAULT 0,
+  	    	    	    	  PerfRate  	    	    	  Float DEFAULT 0,
+  	    	    	    	  NetProd  	    	    	    	  Float DEFAULT 0,
+  	    	    	    	  Waste  	    	    	    	  Float DEFAULT 0,
+  	    	    	    	  QualRate  	    	    	  Float DEFAULT 0,
+  	    	    	    	  PerfDT  	    	    	    	  Float DEFAULT 0,
+  	    	    	    	  RunTime  	    	    	    	  Float DEFAULT 0,
+  	    	    	    	  LoadTime  	    	    	  Float DEFAULT 0,
+  	    	    	    	  AvailRate  	    	    	  Float DEFAULT 0,
+  	    	    	    	  OEE  	    	    	    	    	  Float DEFAULT 0
+  	    	    	    	  ,NPT Float DEFAULT 0 --NPT for the time slice
+ 	  	  	  	  ,IsNPT BIT DEFAULT 0
+  	    	    	    	  )  	  
+  	    	    	    	    	    	  
+DECLARE @ProductRunCounts TABLE(  	  
+  	    	    	    	  ProdId int UNIQUE,
+  	    	    	    	  Counts int)
+DECLARE   @MultipleRunProducts TABLE(
+  	    	    	    	  MRPId int IDENTITY (1,1) PRIMARY KEY NONCLUSTERED,
+  	    	    	    	  ProdId int,
+  	    	    	    	  ProdCodeDesc nvarchar(50),
+  	    	    	    	  StartTime datetime,
+  	    	    	    	  EndTime datetime,
+  	    	    	    	  ProdIdMRPId nvarchar(50)
+  	    	    	    	  )
+SELECT  	  @ProductionRateFactor  	    	  = dbo.fnGEPSProdRateFactor(Production_Rate_TimeUnits)
+FROM dbo.Prod_Units WITH (NOLOCK)
+WHERE PU_Id = @PUId
+DELETE FROM @Slices WHERE PUId = 0
+Update @Slices SET ProductionDay = [dbo].[fnServer_CmnConvertFromDbTime](ProductionDay,@InTimeZone) WHERE ProductionDay IS NOT NULL 
+DELETE FROM @rsSlices
+
+IF @rptParmProductSummary = 1
+  	  BEGIN
+  	    	  --Get all product changes over the reporting time range
+  	    	    	  INSERT INTO @MultipleRunProducts (
+  	    	    	    	  ProdId,
+  	    	    	    	  StartTime,
+  	    	    	    	  EndTime)
+  	    	    	    	  SELECT ProdId , StartTime , EndTime FROM  dbo.fnBF_GetPSFromEvents(@PUId,@StartTime,@EndTime,16) 
+  	    	    	  --END
+  	    	  UPDATE mrps
+  	    	  SET ProdCodeDesc = Prod_Code 
+  	    	  FROM @MultipleRunProducts mrps JOIN Products p ON mrps.ProdId = p.Prod_id
+  	    	  --Get the product counts for each product, over the reporting time range
+  	    	  INSERT INTO @ProductRunCounts (ProdId,Counts)
+  	    	  SELECT ProdId, count(ProdId) AS [Counts]
+  	    	    	  FROM @MultipleRunProducts 
+  	    	    	  GROUP BY ProdId
+  	    	  --Retain Products that have more than 1 product run, over the reporting time range.
+  	    	  DELETE FROM @MultipleRunProducts
+  	    	    	  WHERE ProdId In (SELECT ProdId FROM @ProductRunCounts WHERE Counts < 2)
+  	    	  -- Loop through all the products that have more than one run, over the reporting time range.
+  	    	  SELECT @LoopCount = 1
+  	    	  SELECT @MaxLoops  = count(*) FROM @MultipleRunProducts
+  	    	  WHILE @LoopCount <= @MaxLoops
+  	    	    	  BEGIN
+  	    	    	    	  --Initialize
+  	    	    	    	  SELECT 
+  	    	    	    	    	  @CurrentRunStartTime  	  = NULL,
+  	    	    	    	    	  @CurrentRunEndTime  	    	  = NULL,   	  
+  	    	    	    	    	  @CurrentRunProdId  	    	  = NULL,
+  	    	    	    	    	  @CurrentRunProdCodeDesc  	  = NULL,
+  	    	    	    	    	  @CurrentRunMRPId  	    	  = NULL
+  	    	    	    	  IF @LoopCount = 1 
+  	    	    	    	    	  BEGIN
+  	    	    	    	    	    	  SELECT TOP 1
+  	    	    	    	    	    	    	  @CurrentRunStartTime  	  = StartTime,
+  	    	    	    	    	    	    	  @CurrentRunEndTime  	    	  = EndTime,   	  
+  	    	    	    	    	    	    	  @CurrentRunProdId  	    	  = ProdId,
+  	    	    	    	    	    	    	  @CurrentRunProdCodeDesc  	  = ProdCodeDesc,
+  	    	    	    	    	    	    	  @CurrentRunMRPId  	    	  = MRPId
+  	    	    	    	    	    	  FROM @MultipleRunProducts
+  	    	    	    	    	    	  ORDER BY StartTime
+  	    	    	    	    	  END
+  	    	    	    	  ELSE
+  	    	    	    	    	  BEGIN
+  	    	    	    	    	    	  SELECT TOP 1
+  	    	    	    	    	    	    	  @CurrentRunStartTime  	  = StartTime,
+  	    	    	    	    	    	    	  @CurrentRunEndTime  	    	  = EndTime,   	  
+  	    	    	    	    	    	    	  @CurrentRunProdId  	    	  = ProdId,
+  	    	    	    	    	    	    	  @CurrentRunProdCodeDesc  	  = ProdCodeDesc,
+  	    	    	    	    	    	    	  @CurrentRunMRPId  	    	  = MRPId
+  	    	    	    	    	    	  FROM @MultipleRunProducts
+  	    	    	    	    	    	  WHERE StartTime > @LastRunStartTime
+  	    	    	    	    	    	  ORDER BY StartTime
+  	    	    	    	    	  END
+  	    	    	    	  SELECT @LastRunStartTime =   	  @CurrentRunStartTime
+  	    	    	    	  -- Update Slices with ProdId + SubGroupId for use in subsequent sort.
+  	    	    	    	  UPDATE s
+  	    	    	    	    	  --SET s.ProdIdSubGroupId = convert(varchar(25),@CurrentRunProdId) + '-' + convert(varchar(25),@LoopCount)
+  	    	    	    	    	  SET s.ProdIdSubGroupId = @CurrentRunProdCodeDesc + '-' + convert(nvarchar(25),@LoopCount)
+  	    	    	    	    	  FROM @Slices s
+  	    	    	    	    	  WHERE  s.PUId = @PUId AND s.StartTime >= @CurrentRunStartTime 
+  	    	    	    	    	    	  AND s.ProdId = @CurrentRunProdId
+  	    	    	    	  SELECT @LoopCount = @LoopCount + 1
+  	    	    	  END 
+  	  END
+
+IF @rptParmProductSummary= 1
+BEGIN 
+  	  
+  	    	  INSERT INTO @rsSlices (  	    	  
+  	    	    	    	  RSSubGroup,
+  	    	    	    	  ProdIdSubGroupId,
+  	    	    	    	  ProdId,
+  	    	    	    	  IdealSpeed,
+  	    	    	    	  ActualSpeed,
+  	    	    	    	  IdealProd,
+  	    	    	    	  PerfRate,
+  	    	    	    	  NetProd,
+  	    	    	    	  Waste,
+  	    	    	    	  QualRate,
+  	    	    	    	  RunTime,
+  	    	    	    	  LoadTime,
+  	    	    	    	  AvailRate,
+  	    	    	    	  OEE
+  	    	    	    	  ,NPT
+  	    	    	    	  ,PPId
+  	    	    	    	  ,PathId
+ 	  	  	  	  ,IsNPT
+  	    	    	    	  )
+  	    	  SELECT -- Group by product for Productiondays that contain more than 1 distinct product
+  	    	    	  1 AS [RSSubGroup],
+  	    	    	  ProdIdSubGroupId,
+  	    	    	  coalesce(AppliedProdId,ProdId),
+  	    	    	  dbo.fnGEPSIdealSpeed(sum(RunTimeGross), sum(ProductionIdeal), @ProductionRateFactor),
+  	    	    	  dbo.fnGEPSActualSpeed(sum(RunTimeGross), sum(ProductionTotal), @ProductionRateFactor),
+  	    	    	  sum(ProductionIdeal), 
+  	    	    	  dbo.fnGEPSPerformance(sum(ProductionTotal), sum(ProductionIdeal), @CapRates),
+  	    	    	  --CASE WHEN (sum(ProductionNet) < 0.0) THEN 0.0 ELSE 
+  	    	    	  sum(ProductionNet) 
+  	    	    	  --END
+  	    	    	  ,
+  	    	    	  sum(WasteQuantity),
+  	    	    	  dbo.fnGEPSQuality(sum(ProductionTotal), sum(WasteQuantity), @CapRates),
+
+  	    	    	  sum(ProductiveTime) --/ 60
+  	    	    	  ,
+  	    	    	  sum(LoadingTime) --/ 60
+  	    	    	  ,
+  	    	    	  dbo.fnGEPSAvailability(sum(LoadingTime), sum(RunTimeGross), @CapRates),
+  	    	    	  dbo.fnGEPSAvailability(sum(LoadingTime), sum(RunTimeGross), @CapRates) / 100
+  	    	    	    	  * dbo.fnGEPSPerformance(sum(ProductionTotal), sum(ProductionIdeal), @CapRates) / 100
+  	    	    	    	  * dbo.fnGEPSQuality(sum(ProductionTotal), sum(WasteQuantity), @CapRates) / 100 * 100
+  	    	    	    	  ,SUM(isnull(NPT,0))
+  	    	    	    	  --,9999
+  	    	    	    	  ,PPId
+  	    	    	    	  ,PathId
+ 	  	  	  	  ,NP
+  	    	  FROM @Slices 
+  	    	  WHERE 
+ 	  	  	 --(NP = 0 OR @FilterNonProductiveTime IN(0) OR @OEEType ='Time Based')
+ 	  	  	 1=1
+  	    	  
+  	    	    	  AND ProdId IS NOT NULL
+  	    	    	  
+  	    	  GROUP BY AppliedProdId,ProdId, ProdIdSubGroupId,PPId,PathId,NP
+  	    	  INSERT INTO @unitData(ProductId,Product,IdealSpeed,ActualSpeed ,IdealProduction,PerformanceRate,
+    	      	      	      	      	      	      	      	   NetProduction ,Waste,QualityRate,PerformanceDowntime,RunTime,
+    	      	      	      	      	      	      	      	   Loadtime,AvaliableRate,OEE,NPT,PPId,ProcessOrder,PathId,PathCode ,IsNPT  	    	    	    	    	    	    	    	   
+  	    	    	    	    	    	    	    	    )
+  	    	    	    	  SELECT 
+  	    	    	    	    	  rss.ProdId,
+  	    	    	    	    	  Product = p.Prod_Code,
+  	    	    	    	    	  IdealSpeed As Ideal_Speed,
+  	    	    	    	    	  ActualSpeed As Actual_Speed,
+  	    	    	    	    	  IdealProd As Ideal_Prod,
+  	    	    	    	    	  PerfRate As Perf_Rate,
+  	    	    	    	    	  NetProd As Net_Prod,
+  	    	    	    	    	  Waste,
+  	    	    	    	    	  QualRate As Qual_Rate,
+  	    	    	    	    	  PerfDT As Perf_DT,
+  	    	    	    	    	  RunTime As Run_Time,
+  	    	    	    	    	  LoadTime As Load_Time,
+  	    	    	    	    	  AvailRate As Avail_Rate,
+  	    	    	    	    	  OEE
+  	    	    	    	    	  ,NPT
+  	    	    	    	    	  ,rss.ppId
+  	    	    	    	    	  ,pp.Process_Order
+  	    	    	    	    	  ,pp.Path_Id
+  	    	    	    	    	  ,pep.Path_Code
+ 	  	  	  	  	  ,rss.IsNPT
+  	    	    	    	  FROM @rsSlices rss
+  	    	    	    	    	  LEFT JOIN dbo.Products p WITH (NOLOCK) ON rss.ProdId = p.Prod_Id
+  	    	    	    	    	  LEFT JOIN dbo.Production_Plan pp WITH (NOLOCK) ON rss.PPId = pp.PP_Id
+  	    	    	    	    	  LEFT JOIN Prdexec_Paths pep on pep.Path_Id = pp.Path_Id 
+  	    	    	    	  ORDER BY rss.ProdId,rss.rsSubGroup
+END
+
+--select * from @unitData
+
+RETURN
+END
